@@ -1,0 +1,239 @@
+"""
+Batch Folder Image Loader for ComfyUI
+--------------------------------------
+Loads images one-by-one from a user-specified folder (including network/UNC paths).
+Images are first copied into ComfyUI's input directory, then loaded from there.
+The node iterates through all images in the folder sequentially.
+
+Usage:
+  1. Provide the full path to a folder containing images (e.g. \\\\SERVER\\share\\images or C:\\my_images).
+  2. The node copies all supported images into ComfyUI's input/batch_loader/ subfolder.
+  3. On each queue prompt, it loads the next image in sequence.
+  4. When all images are processed, it wraps back to the first image.
+"""
+
+import os
+import shutil
+import hashlib
+import logging
+import time
+
+import numpy as np
+import torch
+from PIL import Image, ImageOps
+
+import folder_paths
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.tif', '.webp'}
+
+
+def get_image_files(folder_path):
+    """Return sorted list of image filenames in the given folder."""
+    if not os.path.isdir(folder_path):
+        return []
+    files = []
+    for f in sorted(os.listdir(folder_path)):
+        if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS:
+            files.append(f)
+    return files
+
+
+def sync_folder_to_input(source_folder, subfolder_name="batch_loader"):
+    """
+    Copy images from source_folder into ComfyUI's input/<subfolder_name>/ directory.
+    Only copies files that are missing or have changed (based on size + mtime).
+    Returns the destination folder path.
+    """
+    input_dir = folder_paths.get_input_directory()
+    dest_folder = os.path.join(input_dir, subfolder_name)
+    os.makedirs(dest_folder, exist_ok=True)
+
+    source_files = get_image_files(source_folder)
+    if not source_files:
+        logger.warning(f"[BatchFolderLoader] No image files found in: {source_folder}")
+        return dest_folder
+
+    # Clean up files in dest that no longer exist in source
+    dest_existing = set(os.listdir(dest_folder)) if os.path.isdir(dest_folder) else set()
+    source_set = set(source_files)
+    for old_file in dest_existing:
+        if old_file not in source_set:
+            try:
+                os.remove(os.path.join(dest_folder, old_file))
+                logger.info(f"[BatchFolderLoader] Removed stale file: {old_file}")
+            except Exception as e:
+                logger.warning(f"[BatchFolderLoader] Could not remove {old_file}: {e}")
+
+    # Copy new or changed files
+    copied_count = 0
+    for fname in source_files:
+        src_path = os.path.join(source_folder, fname)
+        dst_path = os.path.join(dest_folder, fname)
+        need_copy = True
+
+        if os.path.exists(dst_path):
+            # Quick check: same size means likely same file
+            src_size = os.path.getsize(src_path)
+            dst_size = os.path.getsize(dst_path)
+            if src_size == dst_size:
+                # Also compare modification time (source must be newer to re-copy)
+                src_mtime = os.path.getmtime(src_path)
+                dst_mtime = os.path.getmtime(dst_path)
+                if src_mtime <= dst_mtime:
+                    need_copy = False
+
+        if need_copy:
+            try:
+                shutil.copy2(src_path, dst_path)
+                copied_count += 1
+            except Exception as e:
+                logger.error(f"[BatchFolderLoader] Failed to copy {fname}: {e}")
+
+    if copied_count > 0:
+        logger.info(f"[BatchFolderLoader] Copied {copied_count} file(s) from {source_folder}")
+
+    return dest_folder
+
+
+class BatchFolderLoader:
+    """
+    Loads images one at a time from a specified folder path.
+    Copies images into ComfyUI's input directory first (handles network paths).
+    Iterates through all images; auto-stops or wraps around.
+    """
+
+    # Class-level tracker for current image index per folder
+    _current_index = {}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "folder_path": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Full path to the folder with images (supports UNC/network paths like \\\\SERVER\\share\\folder)"
+                }),
+                "auto_queue_reset": (["enable", "disable"], {
+                    "default": "enable",
+                    "tooltip": "When enabled, resets index to 0 after processing all images"
+                }),
+            },
+            "optional": {
+                "start_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 99999,
+                    "step": 1,
+                    "tooltip": "Override: start from this image index (0-based). Set to 0 for normal sequential operation."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "INT", "INT")
+    RETURN_NAMES = ("image", "mask", "filename", "folder_path", "current_index", "total_images")
+    FUNCTION = "load_image"
+    CATEGORY = "image"
+    OUTPUT_NODE = False
+    DESCRIPTION = "Loads images one by one from a folder. Copies remote/network images to ComfyUI input first."
+
+    @classmethod
+    def IS_CHANGED(cls, folder_path, auto_queue_reset="enable", start_index=0):
+        """Force re-execution every time by returning a unique value."""
+        # Hash based on folder contents so it re-syncs when files change
+        if not folder_path or not os.path.isdir(folder_path):
+            return float("nan")
+
+        files = get_image_files(folder_path)
+        # Include current time to always force re-execution
+        m = hashlib.sha256()
+        m.update(folder_path.encode())
+        for f in files:
+            full = os.path.join(folder_path, f)
+            m.update(f.encode())
+            try:
+                m.update(str(os.path.getmtime(full)).encode())
+            except:
+                pass
+        # Always changing value to force re-run on each queue
+        m.update(str(time.time()).encode())
+        return m.hexdigest()
+
+    def load_image(self, folder_path, auto_queue_reset="enable", start_index=0):
+        folder_path = folder_path.strip()
+
+        if not folder_path:
+            raise ValueError("[BatchFolderLoader] folder_path is empty. Please provide a path.")
+
+        if not os.path.isdir(folder_path):
+            raise ValueError(f"[BatchFolderLoader] Folder not found or not accessible: {folder_path}")
+
+        # Sync source folder to ComfyUI input directory
+        dest_folder = sync_folder_to_input(folder_path)
+
+        # Get sorted list of images from the destination (already synced)
+        image_files = get_image_files(dest_folder)
+        if not image_files:
+            raise ValueError(f"[BatchFolderLoader] No supported images found in: {folder_path}")
+
+        total_images = len(image_files)
+
+        # Determine current index
+        folder_key = os.path.normpath(folder_path)
+        if folder_key not in BatchFolderLoader._current_index:
+            BatchFolderLoader._current_index[folder_key] = start_index
+
+        current_idx = BatchFolderLoader._current_index[folder_key]
+
+        # Handle start_index override (if user manually sets it, honor it)
+        if start_index > 0 and start_index != current_idx:
+            current_idx = start_index
+            BatchFolderLoader._current_index[folder_key] = current_idx
+
+        # Wrap around or clamp
+        if current_idx >= total_images:
+            if auto_queue_reset == "enable":
+                current_idx = 0
+            else:
+                current_idx = total_images - 1
+                logger.info(f"[BatchFolderLoader] All {total_images} images processed. Staying on last image.")
+
+        # Load the image
+        image_name = image_files[current_idx]
+        image_path = os.path.join(dest_folder, image_name)
+
+        logger.info(f"[BatchFolderLoader] Loading image {current_idx + 1}/{total_images}: {image_name}")
+
+        img = Image.open(image_path)
+        img = ImageOps.exif_transpose(img)
+
+        if img.mode == 'I':
+            img = img.point(lambda i: i * (1 / 255))
+        image = img.convert("RGB")
+        image = np.array(image).astype(np.float32) / 255.0
+        image = torch.from_numpy(image)[None,]
+
+        # Handle mask (alpha channel)
+        if 'A' in img.getbands():
+            mask = np.array(img.getchannel('A')).astype(np.float32) / 255.0
+            mask = 1. - torch.from_numpy(mask)
+        else:
+            mask = torch.zeros((image.shape[1], image.shape[2]), dtype=torch.float32)
+
+        # Advance index for next execution
+        BatchFolderLoader._current_index[folder_key] = current_idx + 1
+
+        return (image, mask, image_name, folder_path, current_idx, total_images)
+
+
+# ---- Registration ----
+
+NODE_CLASS_MAPPINGS = {
+    "BatchFolderLoader": BatchFolderLoader,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "BatchFolderLoader": "Batch Folder Image Loader",
+}

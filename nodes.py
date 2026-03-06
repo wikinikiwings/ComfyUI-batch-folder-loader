@@ -1,0 +1,176 @@
+"""
+Batch Folder Image Loader
+Upload a folder of images via browser, auto-iterate through them.
+Supports per-user isolation and full folder sync (mirrors deletions).
+"""
+
+import os
+import hashlib
+import logging
+import time
+import shutil
+
+import numpy as np
+import torch
+from PIL import Image, ImageOps
+
+import folder_paths
+from server import PromptServer
+from aiohttp import web
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.tif', '.webp'}
+
+
+def get_image_files(folder_path):
+    if not os.path.isdir(folder_path):
+        return []
+    return [f for f in sorted(os.listdir(folder_path))
+            if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS]
+
+
+# --- API: clear a subfolder before re-upload (mirrors deletions) ---
+@PromptServer.instance.routes.post("/batch_folder_loader/clear")
+async def clear_subfolder(request):
+    """Delete all images in a subfolder so a fresh upload mirrors the local folder exactly."""
+    data = await request.json()
+    subfolder = data.get("subfolder", "")
+
+    if not subfolder or ".." in subfolder:
+        return web.json_response({"error": "Invalid subfolder"}, status=400)
+
+    input_dir = folder_paths.get_input_directory()
+    target = os.path.join(input_dir, subfolder)
+
+    # Safety: must be inside input dir
+    if os.path.commonpath((input_dir, os.path.abspath(target))) != input_dir:
+        return web.json_response({"error": "Invalid path"}, status=403)
+
+    removed = 0
+    if os.path.isdir(target):
+        for f in os.listdir(target):
+            fp = os.path.join(target, f)
+            if os.path.isfile(fp):
+                os.remove(fp)
+                removed += 1
+
+    return web.json_response({"removed": removed})
+
+
+# --- API: list images in a subfolder ---
+@PromptServer.instance.routes.get("/batch_folder_loader/info/{subfolder:.*}")
+async def subfolder_info(request):
+    subfolder = request.match_info.get("subfolder", "")
+    input_dir = folder_paths.get_input_directory()
+    target = os.path.join(input_dir, subfolder)
+    if not os.path.isdir(target):
+        return web.json_response({"count": 0, "files": []})
+    files = get_image_files(target)
+    return web.json_response({"count": len(files), "files": files})
+
+
+class BatchFolderLoader:
+
+    _current_index = {}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "subfolder": ("STRING", {
+                    "default": "batch",
+                    "multiline": False,
+                }),
+                "auto_iterate": (["enable", "disable"], {
+                    "default": "enable",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "INT", "INT")
+    RETURN_NAMES = ("image", "mask", "filename", "current_index", "total_images")
+    FUNCTION = "load_image"
+    CATEGORY = "image"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Upload a folder of images, then iterate through them automatically."
+
+    @classmethod
+    def IS_CHANGED(cls, subfolder, auto_iterate="enable"):
+        return time.time()
+
+    def load_image(self, subfolder, auto_iterate="enable"):
+        # Subfolder comes pre-formatted as "browserId/folderName" from JS
+        # Sanitize: remove any .. shenanigans
+        subfolder = subfolder.strip().strip('"').strip("'")
+        subfolder = subfolder.replace("..", "").strip("/").strip("\\")
+        if not subfolder:
+            subfolder = "batch"
+
+        input_dir = folder_paths.get_input_directory()
+        target_folder = os.path.join(input_dir, subfolder)
+
+        # Safety check
+        if os.path.commonpath((input_dir, os.path.abspath(target_folder))) != input_dir:
+            raise ValueError("[BatchFolderLoader] Invalid subfolder path.")
+
+        if not os.path.isdir(target_folder):
+            os.makedirs(target_folder, exist_ok=True)
+
+        image_files = get_image_files(target_folder)
+        if not image_files:
+            raise ValueError(
+                f"[BatchFolderLoader] No images found.\n"
+                f"Click 'Upload Folder' on the node to add images."
+            )
+
+        total_images = len(image_files)
+        folder_key = os.path.normpath(target_folder)
+
+        if folder_key not in BatchFolderLoader._current_index:
+            BatchFolderLoader._current_index[folder_key] = 0
+        current_idx = BatchFolderLoader._current_index[folder_key]
+
+        if current_idx >= total_images:
+            current_idx = 0
+
+        image_name = image_files[current_idx]
+        image_path = os.path.join(target_folder, image_name)
+        logger.info(f"[BatchFolderLoader] [{current_idx + 1}/{total_images}] {image_name}")
+
+        img = Image.open(image_path)
+        img = ImageOps.exif_transpose(img)
+
+        if img.mode == 'I':
+            img = img.point(lambda i: i * (1 / 255))
+        image = img.convert("RGB")
+        image = np.array(image).astype(np.float32) / 255.0
+        image = torch.from_numpy(image)[None,]
+
+        if 'A' in img.getbands():
+            mask = np.array(img.getchannel('A')).astype(np.float32) / 255.0
+            mask = 1.0 - torch.from_numpy(mask)
+        else:
+            mask = torch.zeros((image.shape[1], image.shape[2]), dtype=torch.float32)
+
+        is_last = (current_idx + 1) >= total_images
+        BatchFolderLoader._current_index[folder_key] = current_idx + 1
+
+        return {
+            "ui": {
+                "current_index": [current_idx],
+                "total_images": [total_images],
+                "filename": [image_name],
+                "is_last": [is_last],
+            },
+            "result": (image, mask, image_name, current_idx, total_images),
+        }
+
+
+NODE_CLASS_MAPPINGS = {
+    "BatchFolderLoader": BatchFolderLoader,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "BatchFolderLoader": "Batch Folder Image Loader",
+}
