@@ -10,4 +10,4 @@ if this happened you can reset comfy history by pressing f12 and pasting in cons
 
 If you want to be more selective (delete only one broken job instead of everything), you can delete by prompt ID:<br>
 `javascriptfetch('/history', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({delete: ["prompt_id_here"]}) })`<br>
-You can find prompt IDs by visiting http://192.168.2.67:5070/history in a new tab — it shows all jobs as JSON.
+You can find prompt IDs by visiting http://192.168.2.67:nnnn/history in a new tab — it shows all jobs as JSON.
