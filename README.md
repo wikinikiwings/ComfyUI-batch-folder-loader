@@ -6,8 +6,8 @@ A simple node that allows you to upload images from a local folder to comfyui ru
 
 also added isolated que trigger node. known issue - do not connect it to "show any" native node - it will brake history
 if this happened you can reset comfy history by pressing f12 and pasting in console:<br>
-`fetch('/history', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({clear: true}) })`
+`fetch('/history', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({clear: true}) })`<br>
 
 If you want to be more selective (delete only one broken job instead of everything), you can delete by prompt ID:<br>
-`javascriptfetch('/history', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({delete: ["prompt_id_here"]}) })`
+`javascriptfetch('/history', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({delete: ["prompt_id_here"]}) })`<br>
 You can find prompt IDs by visiting http://192.168.2.67:5070/history in a new tab — it shows all jobs as JSON.
