@@ -1,7 +1,7 @@
 """
-Batch Folder Image Loader
-Upload a folder of images via browser, auto-iterate through them.
-Supports per-user isolation and full folder sync (mirrors deletions).
+ComfyUI Queue Tools
+- BatchFolderLoader: Upload & iterate through image folders
+- IsolatedQueueTrigger: Trigger the queue N times with workflow isolation
 """
 
 import os
@@ -33,7 +33,6 @@ def get_image_files(folder_path):
 # --- API: clear a subfolder before re-upload (mirrors deletions) ---
 @PromptServer.instance.routes.post("/batch_folder_loader/clear")
 async def clear_subfolder(request):
-    """Delete all images in a subfolder so a fresh upload mirrors the local folder exactly."""
     data = await request.json()
     subfolder = data.get("subfolder", "")
 
@@ -43,7 +42,6 @@ async def clear_subfolder(request):
     input_dir = folder_paths.get_input_directory()
     target = os.path.join(input_dir, subfolder)
 
-    # Safety: must be inside input dir
     if os.path.commonpath((input_dir, os.path.abspath(target))) != input_dir:
         return web.json_response({"error": "Invalid path"}, status=403)
 
@@ -70,6 +68,9 @@ async def subfolder_info(request):
     return web.json_response({"count": len(files), "files": files})
 
 
+# ==============================================================
+# BatchFolderLoader
+# ==============================================================
 class BatchFolderLoader:
 
     _current_index = {}
@@ -100,8 +101,6 @@ class BatchFolderLoader:
         return time.time()
 
     def load_image(self, subfolder, auto_iterate="enable"):
-        # Subfolder comes pre-formatted as "browserId/folderName" from JS
-        # Sanitize: remove any .. shenanigans
         subfolder = subfolder.strip().strip('"').strip("'")
         subfolder = subfolder.replace("..", "").strip("/").strip("\\")
         if not subfolder:
@@ -110,7 +109,6 @@ class BatchFolderLoader:
         input_dir = folder_paths.get_input_directory()
         target_folder = os.path.join(input_dir, subfolder)
 
-        # Safety check
         if os.path.commonpath((input_dir, os.path.abspath(target_folder))) != input_dir:
             raise ValueError("[BatchFolderLoader] Invalid subfolder path.")
 
@@ -158,6 +156,7 @@ class BatchFolderLoader:
 
         return {
             "ui": {
+                "images": [],
                 "current_index": [current_idx],
                 "total_images": [total_images],
                 "filename": [image_name],
@@ -167,10 +166,81 @@ class BatchFolderLoader:
         }
 
 
+# ==============================================================
+# IsolatedQueueTrigger
+# ==============================================================
+class IsolatedQueueTrigger:
+
+    _counters = {}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "total": ("INT", {
+                    "default": 10,
+                    "min": 1,
+                    "max": 99999,
+                    "step": 1,
+                }),
+            },
+            "optional": {
+                "signal": ("*",),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = ("*", "INT", "INT")
+    RETURN_NAMES = ("signal_opt", "count", "total")
+    FUNCTION = "trigger"
+    CATEGORY = "utils"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Triggers the queue N times with workflow isolation."
+
+    @classmethod
+    def IS_CHANGED(cls, total=10, signal=None, unique_id=None):
+        return time.time()
+
+    def trigger(self, total=10, signal=None, unique_id=None):
+        key = str(unique_id) if unique_id else "default"
+
+        if key not in IsolatedQueueTrigger._counters:
+            IsolatedQueueTrigger._counters[key] = 0
+
+        count = IsolatedQueueTrigger._counters[key]
+
+        if count >= total:
+            count = 0
+            IsolatedQueueTrigger._counters[key] = 0
+
+        current = count
+        is_last = (current + 1) >= total
+        IsolatedQueueTrigger._counters[key] = current + 1
+
+        logger.info(f"[IsolatedQueueTrigger] [{current + 1}/{total}]")
+
+        return {
+            "ui": {
+                "images": [],
+                "count": [current],
+                "total": [total],
+                "is_last": [is_last],
+            },
+            "result": (signal, current, total),
+        }
+
+
+# ==============================================================
+# Registration
+# ==============================================================
 NODE_CLASS_MAPPINGS = {
     "BatchFolderLoader": BatchFolderLoader,
+    "IsolatedQueueTrigger": IsolatedQueueTrigger,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BatchFolderLoader": "Batch Folder Image Loader",
+    "IsolatedQueueTrigger": "Isolated Queue Trigger",
 }
