@@ -30,6 +30,18 @@ def get_image_files(folder_path):
             if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS]
 
 
+# --- API: reset the iteration index for a subfolder ---
+@PromptServer.instance.routes.post("/batch_folder_loader/reset_index")
+async def reset_index(request):
+    data = await request.json()
+    subfolder = data.get("subfolder", "")
+    input_dir = folder_paths.get_input_directory()
+    target = os.path.join(input_dir, subfolder)
+    folder_key = os.path.normpath(target)
+    BatchFolderLoader._current_index.pop(folder_key, None)
+    return web.json_response({"reset": True})
+
+
 # --- API: clear a subfolder before re-upload (mirrors deletions) ---
 @PromptServer.instance.routes.post("/batch_folder_loader/clear")
 async def clear_subfolder(request):

@@ -1,37 +1,11 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-const autoIterateState = new Map();
+// nodeId (string) → { enabled, node, statusWidget }
+const nodeState = new Map();
 
-// --- The key fix: capture the EXACT prompt payload at queue time ---
-let savedPromptBody = null;
-let isAutoIterating = false;
-
-// Intercept fetch to capture the prompt JSON when first queued
-const originalFetch = window.fetch;
-window.fetch = async function(url, options) {
-    // Only intercept POST /prompt and only if we're NOT already auto-iterating
-    // (auto-iterate sends its own saved body, don't re-capture that)
-    if (!isAutoIterating && typeof url === "string" && url.endsWith("/prompt") &&
-        options?.method === "POST" && options?.body) {
-        try {
-            const body = JSON.parse(options.body);
-            if (body.prompt) {
-                // Check if any node in this prompt is a BatchFolderLoader with auto_iterate
-                for (const nodeId of Object.keys(body.prompt)) {
-                    const nodeData = body.prompt[nodeId];
-                    if (nodeData.class_type === "BatchFolderLoader" &&
-                        nodeData.inputs?.auto_iterate === "enable") {
-                        // Save the entire POST body for replay
-                        savedPromptBody = options.body;
-                        break;
-                    }
-                }
-            }
-        } catch (e) { /* ignore parse errors */ }
-    }
-    return originalFetch.apply(this, arguments);
-};
+// Prevent overlapping re-queues: tracks which node is mid-iteration
+const iterating = new Set();
 
 // --- Persistent browser ID ---
 function getBrowserId() {
@@ -46,53 +20,54 @@ function getBrowserId() {
     return id;
 }
 
-// Auto-queue: replay the SAVED prompt, not the current UI
+// --- Re-queue using the live graph (no saved-body fragility) ---
+async function reQueue() {
+    try {
+        const p = await app.graphToPrompt();
+        await api.queuePrompt(0, p);
+    } catch (e) {
+        console.error("[BatchFolderLoader] Re-queue failed:", e);
+    }
+}
+
+// --- Handle executed events ---
 api.addEventListener("executed", async ({ detail }) => {
-    const nodeId = detail?.node;
+    const nodeId = String(detail?.node ?? "");
     if (!nodeId) return;
 
-    const state = autoIterateState.get(String(nodeId));
-    if (!state || !state.enabled) return;
+    const state = nodeState.get(nodeId);
+    if (!state?.enabled) return;
 
     const output = detail?.output;
     if (!output) return;
 
-    const isLast = output.is_last?.[0];
-    const currentIdx = output.current_index?.[0] ?? 0;
+    const isLast      = !!output.is_last?.[0];
+    const currentIdx  = output.current_index?.[0] ?? 0;
     const totalImages = output.total_images?.[0] ?? 0;
-    const filename = output.filename?.[0] ?? "";
+    const filename    = output.filename?.[0] ?? "";
 
+    // Update status label
     if (state.statusWidget) {
-        state.statusWidget.value = `[${currentIdx + 1}/${totalImages}] ${filename}`;
+        state.statusWidget.value = isLast
+            ? `Done — ${totalImages} images processed`
+            : `[${currentIdx + 1}/${totalImages}] ${filename}`;
         state.node?.setDirtyCanvas?.(true);
     }
 
     if (isLast) {
-        savedPromptBody = null;
-        isAutoIterating = false;
-        if (state.statusWidget) {
-            state.statusWidget.value = `Done — ${totalImages} images processed`;
-            state.node?.setDirtyCanvas?.(true);
-        }
+        iterating.delete(nodeId);
         return;
     }
 
-    // Re-queue using the EXACT saved prompt
-    if (savedPromptBody) {
-        setTimeout(async () => {
-            try {
-                isAutoIterating = true;
-                await originalFetch("/prompt", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: savedPromptBody,
-                });
-            } catch (e) {
-                console.error("[BatchFolderLoader] Re-queue failed:", e);
-                isAutoIterating = false;
-            }
-        }, 300);
-    }
+    // Guard against double-fire
+    if (iterating.has(nodeId)) return;
+    iterating.add(nodeId);
+
+    setTimeout(async () => {
+        await reQueue();
+        // Keep nodeId in iterating until the NEXT executed event clears/re-adds it
+        iterating.delete(nodeId);
+    }, 150);
 });
 
 app.registerExtension({
@@ -101,37 +76,37 @@ app.registerExtension({
     async nodeCreated(node) {
         if (node.comfyClass !== "BatchFolderLoader") return;
 
-        const subfolderWidget = node.widgets?.find(w => w.name === "subfolder");
+        const subfolderWidget   = node.widgets?.find(w => w.name === "subfolder");
         const autoIterateWidget = node.widgets?.find(w => w.name === "auto_iterate");
 
-        // Hide the subfolder widget
+        // Hide the raw subfolder widget — managed internally
         if (subfolderWidget) {
             subfolderWidget.type = "hidden";
             subfolderWidget.computeSize = () => [0, -4];
         }
 
-        // Status display
+        // Status display widget
         const statusWidget = node.addWidget("text", "status", "Click 'Upload Folder' to begin", () => {}, {
             serialize: false,
         });
 
-        const updateState = () => {
-            autoIterateState.set(String(node.id), {
+        const syncState = () => {
+            nodeState.set(String(node.id), {
                 enabled: autoIterateWidget?.value === "enable",
                 node,
                 statusWidget,
             });
         };
-        updateState();
+        syncState();
 
         if (autoIterateWidget) {
             const orig = autoIterateWidget.callback;
-            autoIterateWidget.callback = (...args) => { orig?.(...args); updateState(); };
+            autoIterateWidget.callback = (...args) => { orig?.(...args); syncState(); };
         }
 
-        node.onConfigure = function(info) { updateState(); };
+        node.onConfigure = () => syncState();
 
-        // --- Upload with sync ---
+        // --- Upload + sync to server ---
         async function syncAndUpload(files, subfolder) {
             const exts = new Set([".png",".jpg",".jpeg",".bmp",".gif",".tiff",".tif",".webp"]);
             const imgs = files.filter(f => exts.has(f.name.substring(f.name.lastIndexOf(".")).toLowerCase()));
@@ -141,16 +116,28 @@ app.registerExtension({
                 return;
             }
 
-            statusWidget.value = "Syncing...";
+            statusWidget.value = "Clearing old files...";
             node.setDirtyCanvas(true);
+
+            // 1. Clear existing files in the subfolder
             try {
-                await originalFetch("/batch_folder_loader/clear", {
+                await fetch("/batch_folder_loader/clear", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ subfolder }),
                 });
             } catch (e) { console.error("[BatchFolderLoader] Clear failed:", e); }
 
+            // 2. Reset Python iteration index so first Queue always starts at image 0
+            try {
+                await fetch("/batch_folder_loader/reset_index", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ subfolder }),
+                });
+            } catch (e) { console.error("[BatchFolderLoader] Index reset failed:", e); }
+
+            // 3. Upload images one by one
             let ok = 0;
             for (let i = 0; i < imgs.length; i++) {
                 statusWidget.value = `Uploading ${i + 1}/${imgs.length}...`;
@@ -161,14 +148,13 @@ app.registerExtension({
                     fd.append("subfolder", subfolder);
                     fd.append("type", "input");
                     fd.append("overwrite", "true");
-                    const r = await originalFetch("/upload/image", { method: "POST", body: fd });
+                    const r = await fetch("/upload/image", { method: "POST", body: fd });
                     if (r.ok) ok++;
                 } catch (e) { console.error("[BatchFolderLoader]", e); }
             }
 
-            // Reset for fresh capture on next Queue
-            savedPromptBody = null;
-            isAutoIterating = false;
+            // Clear any in-progress iteration state
+            iterating.delete(String(node.id));
 
             statusWidget.value = `${ok} images ready — press Queue to start`;
             node.setDirtyCanvas(true);
@@ -185,15 +171,12 @@ app.registerExtension({
                 const files = Array.from(input.files);
                 if (!files.length) return;
 
-                const relPath = files[0].webkitRelativePath || "";
+                const relPath      = files[0].webkitRelativePath || "";
                 const rawFolderName = relPath.split("/")[0] || "batch";
-                const browserId = getBrowserId();
-                const subfolder = `${browserId}/${rawFolderName}`;
+                const browserId    = getBrowserId();
+                const subfolder    = `${browserId}/${rawFolderName}`;
 
-                if (subfolderWidget) {
-                    subfolderWidget.value = subfolder;
-                }
-
+                if (subfolderWidget) subfolderWidget.value = subfolder;
                 syncAndUpload(files, subfolder);
             };
             input.click();
